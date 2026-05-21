@@ -29,6 +29,7 @@ BOT_STATES_FILE = DATA_DIR / "bot_states.json"
 USER_SETTINGS_FILE = DATA_DIR / "user_settings.json"
 POSTS_LOG_FILE = DATA_DIR / "posts_log.json"
 SCHEDULED_POSTS_FILE = DATA_DIR / "scheduled_posts.json"
+PROCESSED_UPDATES_FILE = DATA_DIR / "processed_updates.json"
 
 SCOPES = ["pages_show_list", "pages_read_engagement", "pages_manage_posts", "business_management"]
 
@@ -255,34 +256,96 @@ def publish_to_instagram(page, post_type, text=None, file_url=None):
     return {"container": c, "publish": p}
 
 
-def publish_content(telegram_id, post_type, text=None, file_url=None, selected_page_ids=None, platforms=None):
-    pages = get_pages_for_user(telegram_id)
+def publish_content(telegram_id, post_type, text=None, file_url=None, selected_page_ids=None, platforms=None, page_ids=None, notify=True):
+    pages = get_pages_for_user(telegram_id) if 'get_pages_for_user' in globals() else get_pages(telegram_id)
     if not pages:
         raise RuntimeError("لا توجد صفحات. أعد ربط Meta.")
-    settings = get_user_settings(telegram_id)
-    selected_page_ids = selected_page_ids or settings.get("selected_pages") or [pages[0]["id"]]
+
+    settings = get_user_settings(telegram_id) if 'get_user_settings' in globals() else get_settings(telegram_id)
+    selected_page_ids = selected_page_ids or page_ids or settings.get("selected_pages") or [pages[0]["id"]]
     platforms = platforms or settings.get("platforms") or ["facebook"]
+
     page_map = {str(p.get("id")): p for p in pages}
-    chosen = [page_map[str(pid)] for pid in selected_page_ids if str(pid) in page_map] or [pages[0]]
+    chosen = [page_map[str(pid)] for pid in selected_page_ids if str(pid) in page_map]
+    if not chosen:
+        chosen = [pages[0]]
+
+    total = len(chosen) * len(platforms)
     results = []
+    step = 0
+
+    if notify:
+        send_telegram(telegram_id, f"🚀 بدأ النشر...
+📌 عدد الوجهات: {total}", keyboard=False)
+
     for page in chosen:
         for platform in platforms:
-            item = {"platform": platform, "page_id": page.get("id"), "page_name": page.get("name"), "success": False}
+            step += 1
+            page_name = page.get("name", "Page")
+            item = {
+                "platform": platform,
+                "page_id": page.get("id"),
+                "page_name": page_name,
+                "success": False,
+            }
             try:
-                if platform == "facebook":
-                    result = publish_to_facebook_page(page, post_type, text=text, file_url=file_url)
-                    item.update({"success": True, "post_id": result.get("id"), "raw": result})
-                elif platform == "instagram":
-                    result = publish_to_instagram(page, post_type, text=text, file_url=file_url)
-                    item.update({"success": True, "post_id": result.get("publish", {}).get("id"), "raw": result})
-                else:
-                    item["error"] = f"منصة غير مدعومة: {platform}"
-            except Exception as e:
-                item["error"] = meta_error_message(e)
-            results.append(item)
-            log_post({"telegram_id": str(telegram_id), "type": post_type, "platform": platform, "page_id": page.get("id"), "page_name": page.get("name"), "success": item.get("success"), "post_id": item.get("post_id"), "error": item.get("error")})
-    return results
+                if notify:
+                    send_telegram(telegram_id, f"⏳ جاري النشر في الصفحة {step}/{total}
+📄 {page_name}
+🌐 {platform}", keyboard=False)
 
+                if platform == "facebook":
+                    if 'publish_to_facebook_page' in globals():
+                        result = publish_to_facebook_page(page, post_type, text=text or "", file_url=file_url)
+                    else:
+                        result = publish_facebook(page, post_type, text=text or "", file_url=file_url)
+                elif platform == "instagram":
+                    if 'publish_to_instagram' in globals():
+                        result = publish_to_instagram(page, post_type, text=text or "", file_url=file_url)
+                    else:
+                        result = publish_instagram(page, post_type, text=text or "", file_url=file_url)
+                else:
+                    raise RuntimeError(f"منصة غير مدعومة: {platform}")
+
+                item["success"] = True
+                item["post_id"] = result.get("id") or result.get("post_id") if isinstance(result, dict) else None
+                item["raw"] = result
+
+                if notify:
+                    send_telegram(telegram_id, f"✅ تم النشر في الصفحة {step}/{total}
+📄 {page_name}
+🆔 Post ID: {item.get('post_id')}", keyboard=False)
+
+            except Exception as e:
+                item["error"] = clean_error(e) if 'clean_error' in globals() else meta_error_message(e)
+                if notify:
+                    send_telegram(telegram_id, f"❌ فشل النشر في الصفحة {step}/{total}
+📄 {page_name}
+السبب: {item['error']}", keyboard=False)
+
+            results.append(item)
+            try:
+                log_post({
+                    "telegram_id": str(telegram_id),
+                    "type": post_type,
+                    "platform": platform,
+                    "page_id": page.get("id"),
+                    "page_name": page_name,
+                    "success": item.get("success"),
+                    "post_id": item.get("post_id"),
+                    "error": item.get("error"),
+                })
+            except Exception:
+                pass
+
+    if notify:
+        ok_count = len([r for r in results if r.get("success")])
+        fail_count = len([r for r in results if not r.get("success")])
+        send_telegram(telegram_id, f"🏁 انتهت عملية النشر
+✅ نجح: {ok_count}
+❌ فشل: {fail_count}")
+
+    return results
 
 def format_publish_results(results):
     ok = [r for r in results if r.get("success")]
@@ -566,6 +629,16 @@ def telegram_webhook():
     chat_id = None
     try:
         update = request.get_json(silent=True) or {}
+
+        # Duplicate protection: prevents Telegram retry from publishing the same media twice.
+        update_id = update.get("update_id")
+        if update_id is not None:
+            processed = load_json(PROCESSED_UPDATES_FILE, [])
+            if update_id in processed:
+                return jsonify({"ok": True, "duplicate": True})
+            processed.append(update_id)
+            save_json(PROCESSED_UPDATES_FILE, processed[-500:])
+
         message = update.get("message") or update.get("edited_message") or {}
         chat_id = (message.get("chat") or {}).get("id")
         text = (message.get("text") or message.get("caption") or "").strip()
