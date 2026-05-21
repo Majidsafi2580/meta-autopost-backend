@@ -135,9 +135,19 @@ def main_keyboard():
     ], "resize_keyboard": True}
 
 
-def send_telegram(chat_id, text, keyboard=True):
+def schedule_keyboard():
+    return {"keyboard": [
+        [{"text": "📝 جدولة نص"}, {"text": "🖼 جدولة صورة"}],
+        [{"text": "🎬 جدولة فيديو"}],
+        [{"text": "❌ إلغاء"}],
+    ], "resize_keyboard": True}
+
+
+def send_telegram(chat_id, text, keyboard=True, custom_keyboard=None):
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    if keyboard:
+    if custom_keyboard:
+        payload["reply_markup"] = custom_keyboard
+    elif keyboard:
         payload["reply_markup"] = main_keyboard()
     return tg_api("sendMessage", payload)
 
@@ -493,6 +503,45 @@ def handle_content_for_state(chat_id, message, text, state):
         send_telegram(chat_id, f"✅ تم حفظ الجدولة\nID: {post['id']}\nالوقت: {text}\nTimezone: {settings.get('timezone')}")
         return True
 
+    if action == "await_destination_pages":
+        pages = get_pages_for_user(chat_id)
+        if not pages:
+            raise RuntimeError("لا توجد صفحات.")
+        if text.lower() == "all":
+            selected = [p["id"] for p in pages]
+        else:
+            nums = [x.strip() for x in text.replace("،", ",").split(",") if x.strip()]
+            selected = []
+            for n in nums:
+                if n.isdigit():
+                    idx = int(n) - 1
+                    if 0 <= idx < len(pages):
+                        selected.append(pages[idx]["id"])
+            if not selected:
+                raise RuntimeError("اختيار غير صحيح. اكتب all أو 1,2")
+
+        state["selected_pages"] = selected
+        state["action"] = "await_destination_platforms"
+        set_state(chat_id, state)
+        send_telegram(chat_id, "اختار المنصات:\nfacebook\ninstagram\nboth")
+        return True
+
+    if action == "await_destination_platforms":
+        val = text.lower().strip()
+        if val == "facebook":
+            platforms = ["facebook"]
+        elif val == "instagram":
+            platforms = ["instagram"]
+        elif val == "both":
+            platforms = ["facebook", "instagram"]
+        else:
+            send_telegram(chat_id, "اكتب: facebook أو instagram أو both")
+            return True
+        update_user_settings(chat_id, {"selected_pages": state.get("selected_pages", []), "platforms": platforms})
+        clear_state(chat_id)
+        send_telegram(chat_id, "✅ تم حفظ وجهة النشر\n" + pages_summary(chat_id))
+        return True
+
     if action == "await_delete_scheduled":
         posts = load_json(SCHEDULED_POSTS_FILE, [])
         found = False
@@ -550,10 +599,14 @@ def telegram_webhook():
                 send_telegram(chat_id, f"✅ تم تحديث الحسابات\nعدد الصفحات: {len(pages)}")
         elif text == "🎯 اختيار وجهة النشر":
             pages = get_pages_for_user(chat_id)
-            if not pages: send_telegram(chat_id, "لا توجد صفحات. أعد ربط Meta.")
+            if not pages:
+                send_telegram(chat_id, "لا توجد صفحات. أعد ربط Meta.")
             else:
-                update_user_settings(chat_id, {"selected_pages": [p["id"] for p in pages], "platforms": ["facebook"]})
-                send_telegram(chat_id, "✅ تم اختيار كل الصفحات للنشر على Facebook حالياً.\nInstagram نفعله بعد حل الربط.")
+                lines = ["اكتب أرقام الصفحات:", "مثال: 1 أو 1,2 أو all", ""]
+                for i, p in enumerate(pages, 1):
+                    lines.append(f"{i}. {p.get('name')}")
+                set_state(chat_id, {"action": "await_destination_pages"})
+                send_telegram(chat_id, "\n".join(lines))
         elif text == "🌍 اختيار التوقيت":
             set_state(chat_id, {"action": "await_timezone"})
             send_telegram(chat_id, "اكتب التوقيت مثل Africa/Algiers\n\n" + "\n".join([f"- {k}: {v}" for k, v in TIMEZONES.items()]))
@@ -570,13 +623,38 @@ def telegram_webhook():
                 if last.get("error"): lines.append(f"آخر خطأ: {last.get('error')}")
             send_telegram(chat_id, "\n".join(lines))
         elif text == "📝 نشر نص":
-            set_state(chat_id, {"action": "await_text_now"}); send_telegram(chat_id, "اكتب نص المنشور الآن.")
+            if state and state.get("action") == "await_schedule_type":
+                set_state(chat_id, {"action": "await_schedule_content_text", "type": "text"})
+                send_telegram(chat_id, "أرسل نص المنشور المجدول.")
+            else:
+                set_state(chat_id, {"action": "await_text_now"})
+                send_telegram(chat_id, "اكتب نص المنشور الآن.")
         elif text == "🖼 نشر صورة":
-            set_state(chat_id, {"action": "await_photo_now"}); send_telegram(chat_id, "ابعث الصورة الآن، ومعاها caption إذا حبيت.")
+            if state and state.get("action") == "await_schedule_type":
+                set_state(chat_id, {"action": "await_schedule_content_photo", "type": "photo"})
+                send_telegram(chat_id, "أرسل الصورة مع caption اختياري للجدولة.")
+            else:
+                set_state(chat_id, {"action": "await_photo_now"})
+                send_telegram(chat_id, "ابعث الصورة الآن، ومعاها caption إذا حبيت.")
         elif text == "🎬 نشر فيديو":
-            set_state(chat_id, {"action": "await_video_now"}); send_telegram(chat_id, "ابعث الفيديو الآن، ومعاه caption إذا حبيت.")
+            if state and state.get("action") == "await_schedule_type":
+                set_state(chat_id, {"action": "await_schedule_content_video", "type": "video"})
+                send_telegram(chat_id, "أرسل الفيديو مع caption اختياري للجدولة.")
+            else:
+                set_state(chat_id, {"action": "await_video_now"})
+                send_telegram(chat_id, "ابعث الفيديو الآن، ومعاه caption إذا حبيت.")
         elif text == "⏰ جدولة منشور":
-            set_state(chat_id, {"action": "await_schedule_type"}); send_telegram(chat_id, "اختار نوع المنشور للجدولة:\nنص\nصورة\nفيديو")
+            set_state(chat_id, {"action": "await_schedule_type"})
+            send_telegram(chat_id, "اختار نوع المنشور للجدولة:", custom_keyboard=schedule_keyboard())
+        elif text in ["📝 جدولة نص", "نص"] and state and state.get("action") == "await_schedule_type":
+            set_state(chat_id, {"action": "await_schedule_content_text", "type": "text"})
+            send_telegram(chat_id, "أرسل نص المنشور المجدول.")
+        elif text in ["🖼 جدولة صورة", "صورة"] and state and state.get("action") == "await_schedule_type":
+            set_state(chat_id, {"action": "await_schedule_content_photo", "type": "photo"})
+            send_telegram(chat_id, "أرسل الصورة مع caption اختياري للجدولة.")
+        elif text in ["🎬 جدولة فيديو", "فيديو"] and state and state.get("action") == "await_schedule_type":
+            set_state(chat_id, {"action": "await_schedule_content_video", "type": "video"})
+            send_telegram(chat_id, "أرسل الفيديو مع caption اختياري للجدولة.")
         elif text == "📋 المنشورات المجدولة":
             posts = [p for p in load_json(SCHEDULED_POSTS_FILE, []) if str(p.get("telegram_id")) == str(chat_id)]
             if not posts: send_telegram(chat_id, "لا توجد منشورات مجدولة.")
