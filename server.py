@@ -256,96 +256,112 @@ def publish_to_instagram(page, post_type, text=None, file_url=None):
     return {"container": c, "publish": p}
 
 
-def publish_content(telegram_id, post_type, text=None, file_url=None, selected_page_ids=None, platforms=None, page_ids=None, notify=True):
+
+def publish_content(telegram_id, post_type, text=None, file_url=None, selected_page_ids=None, platforms=None, notify=True, page_ids=None):
     pages = get_pages_for_user(telegram_id) if 'get_pages_for_user' in globals() else get_pages(telegram_id)
     if not pages:
-        raise RuntimeError("لا توجد صفحات. أعد ربط Meta.")
+        raise RuntimeError("لا توجد صفحات مربوطة. أعد ربط Meta.")
+
+    if page_ids is not None and selected_page_ids is None:
+        selected_page_ids = page_ids
 
     settings = get_user_settings(telegram_id) if 'get_user_settings' in globals() else get_settings(telegram_id)
-    selected_page_ids = selected_page_ids or page_ids or settings.get("selected_pages") or [pages[0]["id"]]
+
+    selected_page_ids = selected_page_ids or settings.get("selected_pages") or [pages[0]["id"]]
     platforms = platforms or settings.get("platforms") or ["facebook"]
 
     page_map = {str(p.get("id")): p for p in pages}
     chosen = [page_map[str(pid)] for pid in selected_page_ids if str(pid) in page_map]
+
     if not chosen:
         chosen = [pages[0]]
 
     total = len(chosen) * len(platforms)
     results = []
-    step = 0
+
+    def _send(msg, kb=False):
+        if 'send_telegram' in globals():
+            return send_telegram(telegram_id, msg, keyboard=kb)
+        return send_msg(telegram_id, msg, keyboard=kb)
 
     if notify:
-        send_telegram(telegram_id, f"🚀 بدأ النشر...
-📌 عدد الوجهات: {total}", keyboard=False)
+        _send("🚀 بدأ النشر...\\n📌 عدد الوجهات: " + str(total), False)
+
+    step = 0
 
     for page in chosen:
         for platform in platforms:
             step += 1
             page_name = page.get("name", "Page")
+
             item = {
                 "platform": platform,
                 "page_id": page.get("id"),
                 "page_name": page_name,
                 "success": False,
             }
+
             try:
                 if notify:
-                    send_telegram(telegram_id, f"⏳ جاري النشر في الصفحة {step}/{total}
-📄 {page_name}
-🌐 {platform}", keyboard=False)
+                    _send("⏳ جاري النشر في الصفحة " + str(step) + "/" + str(total) + "\\n📄 " + page_name + "\\n🌐 " + platform, False)
 
                 if platform == "facebook":
                     if 'publish_to_facebook_page' in globals():
-                        result = publish_to_facebook_page(page, post_type, text=text or "", file_url=file_url)
+                        result = publish_to_facebook_page(page, post_type, text=text, file_url=file_url)
                     else:
                         result = publish_facebook(page, post_type, text=text or "", file_url=file_url)
+
                 elif platform == "instagram":
                     if 'publish_to_instagram' in globals():
-                        result = publish_to_instagram(page, post_type, text=text or "", file_url=file_url)
+                        result = publish_to_instagram(page, post_type, text=text, file_url=file_url)
                     else:
                         result = publish_instagram(page, post_type, text=text or "", file_url=file_url)
+
                 else:
-                    raise RuntimeError(f"منصة غير مدعومة: {platform}")
+                    raise RuntimeError("منصة غير مدعومة: " + str(platform))
 
                 item["success"] = True
-                item["post_id"] = result.get("id") or result.get("post_id") if isinstance(result, dict) else None
+                item["post_id"] = result.get("id") or result.get("post_id")
                 item["raw"] = result
 
                 if notify:
-                    send_telegram(telegram_id, f"✅ تم النشر في الصفحة {step}/{total}
-📄 {page_name}
-🆔 Post ID: {item.get('post_id')}", keyboard=False)
+                    _send("✅ تم النشر في الصفحة " + str(step) + "/" + str(total) + "\\n📄 " + page_name + "\\n🆔 Post ID: " + str(item.get("post_id")), False)
 
             except Exception as e:
-                item["error"] = clean_error(e) if 'clean_error' in globals() else meta_error_message(e)
+                if 'meta_error_message' in globals():
+                    item["error"] = meta_error_message(e)
+                elif 'clean_error' in globals():
+                    item["error"] = clean_error(e)
+                else:
+                    item["error"] = str(e)
+
                 if notify:
-                    send_telegram(telegram_id, f"❌ فشل النشر في الصفحة {step}/{total}
-📄 {page_name}
-السبب: {item['error']}", keyboard=False)
+                    _send("❌ فشل النشر في الصفحة " + str(step) + "/" + str(total) + "\\n📄 " + page_name + "\\nالسبب: " + str(item["error"]), False)
 
             results.append(item)
-            try:
-                log_post({
-                    "telegram_id": str(telegram_id),
-                    "type": post_type,
-                    "platform": platform,
-                    "page_id": page.get("id"),
-                    "page_name": page_name,
-                    "success": item.get("success"),
-                    "post_id": item.get("post_id"),
-                    "error": item.get("error"),
-                })
-            except Exception:
-                pass
+
+            if 'log_post' in globals():
+                try:
+                    log_post({
+                        "telegram_id": str(telegram_id),
+                        "type": post_type,
+                        "platform": platform,
+                        "page_id": page.get("id"),
+                        "page_name": page_name,
+                        "success": item.get("success"),
+                        "post_id": item.get("post_id"),
+                        "error": item.get("error"),
+                    })
+                except Exception:
+                    pass
 
     if notify:
-        ok_count = len([r for r in results if r.get("success")])
-        fail_count = len([r for r in results if not r.get("success")])
-        send_telegram(telegram_id, f"🏁 انتهت عملية النشر
-✅ نجح: {ok_count}
-❌ فشل: {fail_count}")
+        ok = len([r for r in results if r.get("success")])
+        fail = len([r for r in results if not r.get("success")])
+        _send("🏁 انتهت عملية النشر\\n✅ نجح: " + str(ok) + "\\n❌ فشل: " + str(fail), True)
 
     return results
+
 
 def format_publish_results(results):
     ok = [r for r in results if r.get("success")]
